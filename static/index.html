@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SnapBill</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div id="auth" class="auth">
+  <div class="card auth-card">
+    <div class="logo">🧾</div>
+    <h1>SnapBill</h1>
+    <p class="muted">Snap a receipt. Track your spending. Ask AI anything.</p>
+    <input id="email" type="email" placeholder="Email address" autocomplete="email">
+    <input id="pw" type="password" placeholder="Password (8+ characters)" autocomplete="current-password" onkeydown="if(event.key==='Enter')signIn()">
+    <div class="btns"><button class="primary" onclick="signIn()">Sign in</button><button onclick="signUp()">Create account</button></div>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header class="top"><div class="brand">🧾 SnapBill</div><button class="ghost" onclick="signOut()">Sign out</button></header>
+  <main>
+    <div id="budget" class="card stats"></div>
+
+    <section class="card">
+      <h2><span class="step">1</span> Scan a receipt</h2>
+      <div class="scanrow">
+        <input id="file" type="file" accept="image/jpeg,image/png">
+        <button class="primary" onclick="scan()">Upload &amp; scan</button>
+      </div>
+      <!-- <div class="opts"><label><input type="checkbox" id="useOllama">Improve with local Ollama</label> -->
+        <!-- <input id="model" type="text" value="llama3.2" title="Ollama model name"></div> -->
+      <div id="msg"></div>
+      <details><summary>Show scanned text</summary><textarea id="ocrText" placeholder="OCR text appears here" readonly></textarea></details>
+    </section>
+
+    <section class="card">
+      <h2><span class="step">2</span> Review &amp; save</h2>
+      <div class="grid">
+        <input id="fMerchant" placeholder="Merchant">
+        <input id="fAmount" type="number" step="0.01" min="0" placeholder="Amount">
+        <input id="fDate" type="date">
+        <select id="fCategory"></select>
+      </div>
+      <input id="fDesc" placeholder="Description (optional)">
+      <button class="primary save" onclick="save()">Save expense</button>
+    </section>
+
+    <section class="card">
+      <h2>✨ Ask AI about your spending</h2>
+      <div class="chips" id="chips"></div>
+      <div id="chatLog"></div>
+      <div id="chatRow">
+        <input id="question" maxlength="500" placeholder="e.g. How much did I spend on food this month?" onkeydown="if(event.key==='Enter')ask()">
+        <button class="primary" id="askBtn" onclick="ask()">Ask</button>
+      </div>
+    </section>
+
+    <section class="card"><h2>📊 Spending by category</h2><div id="summary"></div></section>
+
+    <section class="card">
+      <h2>🧾 Your expenses</h2>
+      <div class="tablewrap"><table>
+        <thead><tr><th>Date</th><th>Merchant</th><th>Category</th><th class="num">Amount</th><th></th></tr></thead>
+        <tbody id="rows"></tbody></table></div>
+    </section>
+  </main>
+</div>
+
+<script>
+const CATS = ['Food','Groceries','Shopping','Utilities','Health','Entertainment','Other'];
+const CAT_WORDS = {
+  Food: /restaurant|cafe|pizza|burger|kitchen|dhaba|swiggy|zomato|bakery|hotel/i,
+  Groceries: /mart|grocer|supermarket|bazaar|fresh|kirana/i,
+  // Travel: /uber|ola|petrol|diesel|fuel|airline|railway|irctc|taxi|bus/i,
+  Utilities: /electric|recharge|broadband|water|gas|bill/i,
+  Health: /pharm|medical|hospital|clinic|chemist|labs?/i,
+  Entertainment: /cinema|movie|pvr|inox|game|theatre/i,
+  Shopping: /amazon|flipkart|store|mall|retail|fashion|mobile/i
+};
+const MONTHS = {jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12};
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let loggedIn = false;
+let receipt = '';
+$('fCategory').innerHTML = CATS.map(c => `<option>${c}</option>`).join('');
+
+async function api(path, opts = {}) {
+  const headers = opts.body instanceof FormData ? {} : {'Content-Type': 'application/json'};
+  const r = await fetch('/api' + path, {...opts, headers});
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 && path !== '/login') { loggedIn = false; show(); throw new Error('Please sign in'); }
+  if (!r.ok) throw new Error(j.error || 'Request failed');
+  return j;
+}
+async function auth(kind) {
+  try {
+    await api('/' + kind, {method: 'POST', body: JSON.stringify({email: $('email').value, password: $('pw').value})});
+    loggedIn = true; $('pw').value = ''; show();
+  } catch (e) { alert(e.message); }
+}
+const signIn = () => auth('login');
+const signUp = () => auth('signup');
+async function signOut() {
+  chatHistory = []; $('chatLog').innerHTML = ''; try { await api('/logout', {method: 'POST'}); } catch (e) {} loggedIn = false; show(); }
+
+async function shrink(file) {
+  const b = await createImageBitmap(file), k = Math.min(1, 1600 / Math.max(b.width, b.height));
+  const c = document.createElement('canvas'); c.width = b.width * k; c.height = b.height * k;
+  c.getContext('2d').drawImage(b, 0, 0, c.width, c.height);
+  return new Promise(r => c.toBlob(r, 'image/jpeg', 0.85));
+}
+
+const iso = (y, m, d) => `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+function parseReceipt(text) {
+  const lines = text.split('\n').map(s => s.trim()).filter(Boolean);
+  const nums = s => (s.match(/\d[\d,]*\.\d{2}/g) || []).map(x => parseFloat(x.replace(/,/g, '')));
+  let amount = 0;
+  for (const l of lines) {
+    if (/total|amount due|net pay|balance due|grand/i.test(l) && !/sub\s*total/i.test(l)) {
+      const n = nums(l); if (n.length) amount = n[n.length - 1];
+    }
+  }
+  if (!amount) amount = Math.max(0, ...nums(text));
+  const merchant = (lines.find(l => /[A-Za-z]{3,}/.test(l)) || '').slice(0, 60);
+  let date = '', m;
+  if ((m = text.match(/(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})/))) date = iso(m[1], m[2], m[3]);
+  else if ((m = text.match(/(\d{1,2})[-\/.](\d{1,2})[-\/.](\d{2,4})/))) date = iso(m[3].length === 2 ? '20' + m[3] : m[3], m[2], m[1]);
+  else if ((m = text.match(/(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?,?\s+(\d{4})/)) && MONTHS[m[2].toLowerCase()]) date = iso(m[3], MONTHS[m[2].toLowerCase()], m[1]);
+  if (!date || isNaN(Date.parse(date))) date = new Date().toISOString().slice(0, 10);
+  const category = CATS.find(c => CAT_WORDS[c] && CAT_WORDS[c].test(text)) || 'Other';
+  return {merchant, amount, date, category};
+}
+
+
+
+function fill(d) {
+  if (d.merchant) $('fMerchant').value = d.merchant;
+  if (d.amount > 0) $('fAmount').value = d.amount;
+  if (d.date && !isNaN(Date.parse(d.date))) $('fDate').value = d.date;
+  if (CATS.includes(d.category)) $('fCategory').value = d.category;
+}
+
+async function scan() {
+  const orig = $('file').files[0]; if (!orig) return;
+  try {
+    const f = await shrink(orig);
+    $('msg').textContent = 'Saving receipt…';
+    const fd = new FormData(); fd.append('file', f, 'receipt.jpg');
+    receipt = (await api('/upload', {method: 'POST', body: fd})).receipt;
+    const res = await Tesseract.recognize(f, 'eng', {logger: m => {
+      if (m.status === 'recognizing text') $('msg').textContent = `Reading text in your browser… ${Math.round(m.progress * 100)}%`; }});
+    const text = res.data.text;
+    $('ocrText').value = text;
+    fill(parseReceipt(text));
+    $('msg').textContent = 'Done. Check the values below, then save.';
+
+  } catch (e) { $('msg').textContent = e.message; }
+}
+
+async function save() {
+  const amount = parseFloat($('fAmount').value);
+  if (!$('fMerchant').value.trim() || !(amount > 0) || !$('fDate').value) { alert('Merchant, amount and date are required'); return; }
+  try {
+    await api('/expenses', {method: 'POST', body: JSON.stringify({
+      merchant: $('fMerchant').value.trim(), amount, date: $('fDate').value,
+      category: $('fCategory').value, description: $('fDesc').value, receipt})});
+    ['fMerchant', 'fAmount', 'fDate', 'fDesc', 'ocrText'].forEach(id => $(id).value = '');
+    receipt = ''; $('msg').textContent = 'Saved.';
+    load();
+  } catch (e) { alert(e.message); }
+}
+
+const CAT_COLORS = {Food:'#f97316',Groceries:'#16a34a',Travel:'#0ea5e9',Shopping:'#ec4899',Utilities:'#eab308',Health:'#ef4444',Entertainment:'#8b5cf6',Other:'#64748b'};
+const pill = c => `<span class="pill" style="--c:${CAT_COLORS[c] || '#64748b'}">${esc(c)}</span>`;
+async function load() {
+  const {expenses, budget} = await api('/expenses');
+  const month = new Date().toISOString().slice(0, 7);
+  const spent = expenses.filter(i => i.month === month).reduce((s, i) => s + i.amount, 0);
+  const over = spent > budget, pct = Math.min(100, spent / budget * 100);
+  $('budget').innerHTML = `
+    <div class="stat"><span class="muted">Spent this month</span><b>${spent.toFixed(2)}</b></div>
+    <div class="stat"><span class="muted">${over ? 'Over budget by' : 'Left in budget'}</span><b class="${over ? 'warn' : 'ok'}">${Math.abs(budget - spent).toFixed(2)}</b></div>
+    <div class="stat"><span class="muted">Monthly budget</span><b>${budget.toFixed(2)}</b></div>
+    <div class="meter"><i class="${over ? 'over' : ''}" style="width:${pct}%"></i></div>`;
+  const by = {};
+  expenses.forEach(i => by[i.category] = (by[i.category] || 0) + i.amount);
+  const max = Math.max(1, ...Object.values(by));
+  $('summary').innerHTML = Object.entries(by).sort((a, b) => b[1] - a[1]).map(([c, v]) =>
+    `<div class="row"><span>${esc(c)}</span><div class="track"><div class="bar" style="width:${v / max * 100}%;background:${CAT_COLORS[c] || '#64748b'}"></div></div><span class="amt">${v.toFixed(2)}</span></div>`).join('')
+    || '<div class="empty">No data yet. Scan your first receipt!</div>';
+  $('rows').innerHTML = expenses.map(i =>
+    `<tr><td>${esc(i.date)}</td><td>${esc(i.merchant)}${i.receipt ? ` <a href="/api/receipts/${esc(i.receipt)}" target="_blank" title="View receipt">📎</a>` : ''}</td><td>${pill(i.category)}</td><td class="num">${i.amount.toFixed(2)}</td>
+     <td><button class="danger" onclick="del('${esc(i.id)}')">Delete</button></td></tr>`).join('')
+    || '<tr><td colspan="5" class="empty">No expenses yet.</td></tr>';
+}
+async function del(id) { try { await api('/expenses/' + id, {method: 'DELETE'}); load(); } catch (e) { alert(e.message); } }
+
+const SUGGESTIONS = ['How much have I spent this month?', 'Which category costs me the most?',
+  'Am I within my budget?', 'What was my biggest expense?', 'Give me tips to save money'];
+$('chips').innerHTML = SUGGESTIONS.map(q => `<button onclick="ask(this.textContent)">${esc(q)}</button>`).join('');
+let chatHistory = [];
+function bubble(cls, text) {
+  const d = document.createElement('div'); d.className = 'bubble ' + cls; d.textContent = text;  // textContent = safe
+  $('chatLog').appendChild(d); $('chatLog').scrollTop = $('chatLog').scrollHeight; return d;
+}
+async function ask(q) {
+  q = (q || $('question').value).trim(); if (!q) return;
+  $('question').value = ''; $('askBtn').disabled = true;
+  bubble('me', q);
+  const wait = bubble('ai', 'Thinking…');
+  try {
+    const {answer} = await api('/chat', {method: 'POST', body: JSON.stringify({question: q, history: chatHistory})});
+    wait.textContent = answer;
+    chatHistory.push({role: 'user', content: q}, {role: 'assistant', content: answer});
+    chatHistory = chatHistory.slice(-6);
+  } catch (e) { wait.textContent = '⚠️ ' + e.message; }
+  $('askBtn').disabled = false;
+}
+
+function show() {
+  $('auth').hidden = loggedIn; $('app').hidden = !loggedIn;
+  if (loggedIn) load().catch(e => $('msg').textContent = e.message);
+}
+// Restore session if the cookie is still valid
+api('/me').then(() => { loggedIn = true; show(); }).catch(() => show());
+</script>
+</body>
+</html>

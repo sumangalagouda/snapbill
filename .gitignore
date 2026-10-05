@@ -1,0 +1,8 @@
+.env
+snapbill.db
+uploads/
+.secret_key
+__pycache__/
+venv/
+.venv/
+
